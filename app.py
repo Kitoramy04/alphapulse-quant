@@ -7,7 +7,7 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 from scipy.stats import spearmanr
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
 import os
 
@@ -87,6 +87,16 @@ def format_price(val, currency):
         return f"{int(round(val)):,}원"
     else:
         return f"${val:.2f}"
+
+def get_asset_live_change(df):
+    """최근 일봉 대비 실시간 장중 변동률(%) 추출"""
+    if df is None or len(df) < 2:
+        return 0.0
+    latest = float(df['Close'].iloc[-1])
+    prev = float(df['Close'].iloc[-2])
+    if prev > 0:
+        return float(((latest - prev) / prev) * 100)
+    return 0.0
 
 # -------------------------------------------------------------
 # 3. 네이버 금융 일별 외인/기관 순매수 수급 시계열 수집
@@ -178,7 +188,7 @@ def fetch_community_buzz_speed(ticker_code):
     return {"speed_label": "정상 범위 (리젠 보통)", "is_surge": False}
 
 # -------------------------------------------------------------
-# 5. 116+ 팩터 라이브러리 생성 (시차 일치 및 결측치 방어)
+# 5. 116+ 팩터 라이브러리 (상충 및 교호작용 팩터 포함)
 # -------------------------------------------------------------
 def build_comprehensive_factors(df_target, df_flow, macro_dict):
     f = {}
@@ -203,13 +213,18 @@ def build_comprehensive_factors(df_target, df_flow, macro_dict):
         f["SUPPLY_INST_Z20"] = (inst - inst.rolling(20).mean()) / (inst.rolling(20).std() + 1e-9)
         f["SUPPLY_INST_ACCUM_10D"] = (inst.rolling(10).sum() / (v.rolling(10).sum() + 1e-9)) * 100
 
-    # 2. 야간 ADR 직격 선행 팩터 (SKHY, SSNLF) - bfill로 0-채움 처리
+    # 2. 야간 ADR 및 상충(Conflict) 교호작용 팩터
     for adr_name in ["SKHY", "SSNLF"]:
         if adr_name in macro_dict and macro_dict[adr_name] is not None and not macro_dict[adr_name].empty:
             m_c = macro_dict[adr_name]['Close'].reindex(df_target.index).ffill().bfill()
             ret_adr = m_c.pct_change(1).fillna(0) * 100
             f[f"ADR_{adr_name}_1D"] = ret_adr
             f[f"ADR_{adr_name}_OVERNIGHT_MOM"] = ret_adr - (c.pct_change(1).fillna(0) * 100)
+            
+            # [신규 교호작용 팩터] 20일 추세와 야간 ADR 간의 방향 상충 감지
+            mom_20 = c.pct_change(20).fillna(0) * 100
+            f[f"CONFLICT_TREND_{adr_name}"] = np.sign(mom_20) * ret_adr
+            f[f"DIVERGENCE_5D_{adr_name}"] = (c.pct_change(5).fillna(0) * 100) - ret_adr
 
     # 3. 멀티호라이즌 모멘텀 (14종)
     for k in [1, 2, 3, 5, 7, 10, 15, 20, 30, 45, 60, 90, 120, 180]:
@@ -263,54 +278,9 @@ def build_comprehensive_factors(df_target, df_flow, macro_dict):
     return pd.DataFrame(f, index=df_target.index)
 
 # -------------------------------------------------------------
-# 6. 듀얼 호라이즌 매크로 중기 레짐(Regime Prior) 산출 엔진
+# 6. 데이터 일괄 수집 엔진 (3분 캐싱)
 # -------------------------------------------------------------
-def calculate_macro_regime_bias(macro_dict, df_target_index):
-    bias = 0.0
-    
-    # 1. 환율 20일 Z-Score
-    if "USDKRW" in macro_dict and not macro_dict["USDKRW"].empty:
-        c_usdkrw = macro_dict["USDKRW"]['Close'].reindex(df_target_index).ffill().bfill()
-        if len(c_usdkrw) >= 20:
-            z_fx = (c_usdkrw.iloc[-1] - c_usdkrw.tail(20).mean()) / (c_usdkrw.tail(20).std() + 1e-9)
-            bias -= float(np.clip(z_fx * 1.5, -3.0, 3.0))
-
-    # 2. 미국 10년물 국채금리(TNX) 추세
-    if "TNX" in macro_dict and not macro_dict["TNX"].empty:
-        c_tnx = macro_dict["TNX"]['Close'].reindex(df_target_index).ffill().bfill()
-        if len(c_tnx) >= 20:
-            tnx_mom20 = (c_tnx.iloc[-1] / (c_tnx.iloc[-20] + 1e-9) - 1) * 100
-            bias -= float(np.clip(tnx_mom20 * 0.15, -2.0, 2.0))
-
-    # 3. 글로벌 반도체/테크 모멘텀 (SOXX, QQQ)
-    tech_proxy = macro_dict.get("SOXX", macro_dict.get("QQQ"))
-    if tech_proxy is not None and not tech_proxy.empty:
-        c_tech = tech_proxy['Close'].reindex(df_target_index).ffill().bfill()
-        if len(c_tech) >= 20:
-            tech_mom20 = (c_tech.iloc[-1] / (c_tech.iloc[-20] + 1e-9) - 1) * 100
-            bias += float(np.clip(tech_mom20 * 0.2, -3.0, 3.0))
-
-    return float(np.clip(bias, -5.0, 5.0))
-
-# -------------------------------------------------------------
-# 7. 매크로 충격 및 이벤트 변동성 확장 엔진
-# -------------------------------------------------------------
-def apply_event_shock_multiplier(base_magnitude, event_type="None"):
-    multiplier = 1.0
-    if event_type == "FOMC / 금리 결정":
-        multiplier = 1.75
-    elif event_type == "미국 CPI 발표":
-        multiplier = 1.50
-    elif event_type in ["DART 호재 공시(자사주/대규모 수주)", "DART 악재 공시(유상증자/CB발행)"]:
-        multiplier = 1.30
-
-    adjusted_mag = base_magnitude * multiplier
-    return float(adjusted_mag), multiplier
-
-# -------------------------------------------------------------
-# 8. 데이터 일괄 수집 엔진
-# -------------------------------------------------------------
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=180)
 def load_all_base_assets():
     target_symbols = {
         "COHR": "COHR",
@@ -363,7 +333,7 @@ def load_all_base_assets():
     return targets, macros
 
 # -------------------------------------------------------------
-# 9. 순수 백테스트 기반 머신러닝 엔진 (유효기간 보정 IC 적용)
+# 7. 비선형 상충 학습 머신러닝 엔진 (HistGradientBoosting)
 # -------------------------------------------------------------
 def run_advanced_quant_engine(df_target, df_flow, macro_dict, buzz_info, event_type="None"):
     df_clean = df_target.dropna(subset=['Close']).copy()
@@ -388,15 +358,13 @@ def run_advanced_quant_engine(df_target, df_flow, macro_dict, buzz_info, event_t
     if n_obs < 60:
         return None
         
-    # [핵심] 상장시기 기간보정 Active-Period IC 검정
-    # 신규 상장 팩터(ADR 등)가 과거 0 패딩 때문에 인위적으로 탈락하지 않고
-    # 실제 데이터가 존재했던 유효 구간의 통계적 설명력을 공정하게 평가
+    # Active-Period IC 검정
     ic_stats = []
     for col in X_train.columns:
         s = X_train[col]
         active_mask = (s != 0.0) & ~s.isna()
         
-        if active_mask.sum() >= 30:  # 최소 30거래일 이상 실제 거래 데이터 존재 시 유효구간 검정
+        if active_mask.sum() >= 30:
             ic, pval = spearmanr(s.loc[active_mask], ret_train.loc[active_mask])
             eff_n = active_mask.sum()
         else:
@@ -416,52 +384,72 @@ def run_advanced_quant_engine(df_target, df_flow, macro_dict, buzz_info, event_t
         })
         
     ic_df = pd.DataFrame(ic_stats).sort_values(by="절대 IC", ascending=False)
-    
-    # 통계적 유의성 통과 팩터만 선별 (어떤 팩터든 동일한 기준 적용)
     sig_candidates = ic_df[(ic_df["절대 IC"] >= 0.025) & (ic_df["p-value"] < 0.15)]["팩터코드"].tolist()
-    if len(sig_candidates) < 6:
-        selected_factors = ic_df["팩터코드"].head(8).tolist()
-    elif len(sig_candidates) > 15:
-        selected_factors = sig_candidates[:15]
+    if len(sig_candidates) < 8:
+        selected_factors = ic_df["팩터코드"].head(10).tolist()
+    elif len(sig_candidates) > 18:
+        selected_factors = sig_candidates[:18]
     else:
         selected_factors = sig_candidates
         
-    # 지수 감쇠 학습 (최근 28거래일에 50% 가중치 부여)
     decay_lambda = 0.975
     sample_weights = np.array([decay_lambda ** (n_obs - 1 - i) for i in range(n_obs)])
     
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train[selected_factors])
-    X_latest_scaled = scaler.transform(X_latest_row[selected_factors])
-    X_prev_scaled = scaler.transform(X_prev_row[selected_factors])
+    X_tr = X_train[selected_factors]
+    X_lt = X_latest_row[selected_factors]
+    X_pr = X_prev_row[selected_factors]
     
-    # 순수 L2 Ridge 회귀가 데이터 기반으로 팩터별 가중치(beta)를 산출
-    model = LogisticRegression(penalty='l2', C=0.3, random_state=42)
-    model.fit(X_train_scaled, y_train, sample_weight=sample_weights)
+    # [핵심] 비선형 트리 앙상블: 추세와 야간급락이 충돌할 때의 조건부 확률을 데이터 기반으로 스스로 학습
+    model = HistGradientBoostingClassifier(
+        max_iter=100,
+        max_depth=4,           # 최대 4개 팩터의 복합 상충 분기 탐색
+        min_samples_leaf=15,   # 통계적 과적합 방지
+        l2_regularization=1.5,
+        random_state=42
+    )
+    model.fit(X_tr, y_train, sample_weight=sample_weights)
     
-    prob_up_raw = float(model.predict_proba(X_latest_scaled)[0][1] * 100)
+    # 모델이 스스로 산출한 조건부 상승 확률
+    prob_up_raw = float(model.predict_proba(X_lt)[0][1] * 100)
     if buzz_info.get("is_surge", False):
         prob_up_raw = np.clip(prob_up_raw + 2.0, 5.0, 95.0)
         
-    prob_up_yesterday = float(model.predict_proba(X_prev_scaled)[0][1] * 100)
+    prob_up_yesterday = float(model.predict_proba(X_pr)[0][1] * 100)
 
-    # 듀얼 호라이즌: 20일 거시 레짐 바이어스 결합
-    macro_regime_bias = calculate_macro_regime_bias(macro_dict, df_clean.index)
-    final_prob_up = float(np.clip(prob_up_raw + macro_regime_bias, 5.0, 95.0))
+    # 이벤트 변동성 확장 승수
+    vol_mult = 1.0
+    if event_type == "FOMC / 금리 결정":
+        vol_mult = 1.75
+    elif event_type == "미국 CPI 발표":
+        vol_mult = 1.50
+    elif event_type in ["DART 호재 공시(자사주/대규모 수주)", "DART 악재 공시(유상증자/CB발행)"]:
+        vol_mult = 1.30
+
+    final_prob_up = float(np.clip(prob_up_raw, 5.0, 95.0))
     final_prob_down = float(100.0 - final_prob_up)
 
-    # 변동폭 산출 및 이벤트 변동성 확장 계수 적용
     daily_vol = float(df_clean['Close'].pct_change().tail(20).std() * 100)
-    base_magnitude = ((final_prob_up - 50.0) / 50.0) * daily_vol * 1.35
-    final_magnitude, vol_mult = apply_event_shock_multiplier(base_magnitude, event_type)
+    final_magnitude = ((final_prob_up - 50.0) / 50.0) * daily_vol * 1.35 * vol_mult
 
-    # 머신러닝이 최적화한 가중치와 기여도
-    coefs = model.coef_[0]
-    scaled_curr = X_latest_scaled[0]
-    contributions = {f_name: float(coefs[idx] * scaled_curr[idx] * 8.0) for idx, f_name in enumerate(selected_factors)}
-    weights_dict = {f_name: float(coefs[idx]) for idx, f_name in enumerate(selected_factors)}
+    # 팩터별 한계 기여도(Marginal Contribution) 분해
+    # 각 팩터를 평균값으로 대체했을 때 확률이 얼마나 변하는지 실측하여 기여도 산출
+    contributions = {}
+    base_p = prob_up_raw
+    X_lt_copy = X_lt.copy()
+    
+    for f_name in selected_factors:
+        orig_val = X_lt_copy[f_name].iloc[0]
+        mean_val = X_tr[f_name].mean()
+        X_lt_copy[f_name] = mean_val
+        p_cf = float(model.predict_proba(X_lt_copy)[0][1] * 100)
+        contributions[f_name] = float(base_p - p_cf)
+        X_lt_copy[f_name] = orig_val
+
+    sorted_c = sorted(contributions.items(), key=lambda x: x[1])
+    top_neg_factor = sorted_c[0] if sorted_c else ("None", 0.0)
+    top_pos_factor = sorted_c[-1] if sorted_c else ("None", 0.0)
         
-    recent_preds = model.predict(X_train_scaled[-60:])
+    recent_preds = model.predict(X_tr.iloc[-60:])
     backtest_acc = float((recent_preds == y_train.iloc[-60:]).mean() * 100)
     
     valid_closes = df_clean['Close'].dropna()
@@ -475,12 +463,12 @@ def run_advanced_quant_engine(df_target, df_flow, macro_dict, buzz_info, event_t
         "prob_up_next": final_prob_up,
         "prob_down_next": final_prob_down,
         "prob_up_yesterday": prob_up_yesterday,
-        "macro_bias": macro_regime_bias,
         "daily_vol": daily_vol,
         "expected_magnitude": final_magnitude,
         "vol_multiplier": vol_mult,
         "contributions": contributions,
-        "weights": weights_dict,
+        "top_pos_factor": top_pos_factor,
+        "top_neg_factor": top_neg_factor,
         "ic_df": ic_df,
         "selected_factors": selected_factors,
         "backtest_acc": backtest_acc,
@@ -488,7 +476,7 @@ def run_advanced_quant_engine(df_target, df_flow, macro_dict, buzz_info, event_t
     }
 
 # -------------------------------------------------------------
-# 10. UI 대시보드 렌더링
+# 8. UI 대시보드 렌더링
 # -------------------------------------------------------------
 st.markdown("## 🏛️ AlphaPulse 인스티튜셔널 퀀트 터미널 Pro")
 
@@ -498,9 +486,8 @@ event_choice = st.sidebar.selectbox(
     ["None", "FOMC / 금리 결정", "미국 CPI 발표", "DART 호재 공시(자사주/대규모 수주)", "DART 악재 공시(유상증자/CB발행)"],
     index=0
 )
-st.sidebar.caption("※ FOMC/CPI 선택 시 예상 변동폭(Magnitude)이 1.5~1.75배 확장 반영됩니다.")
 
-with st.spinner("6개 종목 데이터 및 수급 시계열, 116개 팩터 전수 검정 수행 중..."):
+with st.spinner("미국 정규장 실시간 데이터 및 비선형 트리 앙상블 학습 중..."):
     all_targets, all_macros = load_all_base_assets()
 
 stock_tabs = st.tabs([
@@ -531,6 +518,56 @@ for ticker_name, tab, currency, ticker_code in tab_mapping:
             
         df_flow = fetch_naver_investor_flows(ticker_code)
         buzz = fetch_community_buzz_speed(ticker_code)
+
+        # 실시간 선행 자산 표시 라벨 구성
+        lead_display_label = "야간 선행 지표"
+        lead_display_val = "0.00%"
+        lead_sub_caption = "동기화 중"
+
+        if ticker_name == "SK하이닉스":
+            skhy_live = get_asset_live_change(all_macros.get("SKHY"))
+            soxx_live = get_asset_live_change(all_macros.get("SOXX"))
+            mu_live = get_asset_live_change(all_macros.get("MU"))
+            lead_display_label = "미장 SKHY ADR 실시간"
+            lead_display_val = f"{skhy_live:+.2f}%"
+            lead_sub_caption = f"SOXX {soxx_live:+.2f}% | MU {mu_live:+.2f}%"
+
+        elif ticker_name == "삼성전자":
+            ssnlf_live = get_asset_live_change(all_macros.get("SSNLF"))
+            soxx_live = get_asset_live_change(all_macros.get("SOXX"))
+            mu_live = get_asset_live_change(all_macros.get("MU"))
+            lead_display_label = "미장 삼성 ADR / 반도체"
+            lead_display_val = f"{ssnlf_live:+.2f}%"
+            lead_sub_caption = f"SOXX {soxx_live:+.2f}% | MU {mu_live:+.2f}%"
+
+        elif ticker_name == "두산에너빌리티":
+            urnm_live = get_asset_live_change(all_macros.get("URNM"))
+            wti_live = get_asset_live_change(all_macros.get("WTI"))
+            lead_display_label = "글로벌 우라늄(URNM) / 유가"
+            lead_display_val = f"{urnm_live:+.2f}%"
+            lead_sub_caption = f"WTI 유가 {wti_live:+.2f}%"
+
+        elif ticker_name == "LS":
+            cop_live = get_asset_live_change(all_macros.get("COPPER"))
+            wti_live = get_asset_live_change(all_macros.get("WTI"))
+            lead_display_label = "국제 구리 선물(COPPER)"
+            lead_display_val = f"{cop_live:+.2f}%"
+            lead_sub_caption = f"WTI 유가 {wti_live:+.2f}%"
+
+        elif ticker_name == "하이브":
+            qqq_live = get_asset_live_change(all_macros.get("QQQ"))
+            usdkrw_live = get_asset_live_change(all_macros.get("USDKRW"))
+            lead_display_label = "미국 QQQ / 환율"
+            lead_display_val = f"{qqq_live:+.2f}%"
+            lead_sub_caption = f"환율 {usdkrw_live:+.2f}%"
+
+        elif ticker_name == "COHR":
+            cohr_live = get_asset_live_change(all_targets.get("COHR"))
+            soxx_live = get_asset_live_change(all_macros.get("SOXX"))
+            lead_display_label = "COHR 미장 실시간"
+            lead_display_val = f"{cohr_live:+.2f}%"
+            lead_sub_caption = f"SOXX {soxx_live:+.2f}%"
+
         res = run_advanced_quant_engine(df_tgt, df_flow, all_macros, buzz, event_type=event_choice)
         
         if res is None:
@@ -540,13 +577,15 @@ for ticker_name, tab, currency, ticker_code in tab_mapping:
         status_color = "🟢" if is_market_open else "🌙"
         st.caption(f"시스템 시각: {time_str} | **{status_color} {session_status}**")
 
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        # -------------------------------------------------------------
+        # 실무형 상단 5대 핵심 판단 지표 카드
+        # -------------------------------------------------------------
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric(f"{ticker_name} 현재가/종가", format_price(res['latest_close'], currency), f"{res['price_change']:+.2f}%")
-        c2.metric("전수 백테스트 팩터", f"{res['total_tested']}개", "수급/기술/매크로/ADR")
-        c3.metric("채택된 유효 팩터", f"{len(res['selected_factors'])}개", "IC 통계 통과")
-        c4.metric("종목토론방/소셜", buzz["speed_label"], "과열 감지" if buzz["is_surge"] else "정상")
-        c5.metric("최근 60일 실전 적중률", f"{res['backtest_acc']:.1f}%", "Out-of-sample")
-        c6.metric("매크로 레짐 바이어스", f"{res['macro_bias']:+.1f}%p", "20일 중기 추세")
+        c2.metric(lead_display_label, lead_display_val, lead_sub_caption)
+        c3.metric("오늘 최고 상승 팩터", f"{res['top_pos_factor'][0]}", f"{res['top_pos_factor'][1]:+.1f}%p 상승기여")
+        c4.metric("오늘 최고 하락 팩터", f"{res['top_neg_factor'][0]}", f"{res['top_neg_factor'][1]:+.1f}%p 하방압력")
+        c5.metric("최근 실전 적중률", f"{res['backtest_acc']:.1f}%", "60일 Out-of-sample")
 
         st.markdown("---")
 
@@ -594,11 +633,11 @@ for ticker_name, tab, currency, ticker_code in tab_mapping:
                     st.write(f"**상승 반대 확률**: {prob_up:.1f}% | 모델 확신도: **하락 우위 (+{prob_down - 50:.1f}%p)**")
                     st.warning(f"🎯 **예상 일일 변동폭(Magnitude)**: **-{abs(exp_mag)*0.7:.2f}% ~ -{abs(exp_mag)*1.3:.2f}%** (하방 압력, 변동성 계수: {res['vol_multiplier']}x)")
                 else:
-                    st.warning(f"### ⚖️ [중립 / 관망 권고] 방향성 탐색 (노이즈 구간){event_badge}")
+                    st.warning(f"### ⚖️ [중립 / 관망 권고] 방향성 탐색 (상충·노이즈 구간){event_badge}")
                     st.write(f"**상승**: {prob_up:.1f}% vs **하락**: {prob_down:.1f}%")
                     st.write(f"🎯 **예상 일일 변동폭**: **±{res['daily_vol']*0.5 * res['vol_multiplier']:.2f}% 내외 박스권 횡보**")
                 
-                st.caption(f"※ 텍티컬 팩터 + 20일 중기 매크로 레짐({res['macro_bias']:+.1f}%p)이 결합된 순수 백테스트 결과입니다.")
+                st.caption(f"※ 장기 추세와 단기 야간 선행 자산의 상충 관계를 비선형 트리 앙상블이 학습하여 도출한 결과입니다.")
 
             # 게이지 차트
             with col_gauge:
@@ -623,25 +662,18 @@ for ticker_name, tab, currency, ticker_code in tab_mapping:
                 fig_g.update_layout(height=230, margin=dict(l=25, r=25, t=10, b=10))
                 st.plotly_chart(fig_g, use_container_width=True)
 
-            # 팩터 기여도 및 가중치 차트
-            c_chart1, c_chart2 = st.columns(2)
+            # 팩터 한계 기여도 차트
+            c_chart1, _ = st.columns([1, 0.01])
             with c_chart1:
                 c_names = list(res["contributions"].keys())
                 c_vals = list(res["contributions"].values())
                 c_colors = ["#10b981" if v >= 0 else "#ef4444" for v in c_vals]
                 fig_bar = go.Figure(go.Bar(x=c_vals, y=c_names, orientation='h', marker_color=c_colors))
-                fig_bar.update_layout(title="채택된 팩터별 확률 기여도 분해 (%p)", height=340, margin=dict(l=10, r=10, t=40, b=10))
+                fig_bar.update_layout(title="머신러닝 트리가 평가한 팩터별 확률 한계 기여도 (%p)", height=380, margin=dict(l=10, r=10, t=40, b=10))
                 st.plotly_chart(fig_bar, use_container_width=True)
 
-            with c_chart2:
-                w_names = list(res["weights"].keys())
-                w_vals = list(res["weights"].values())
-                fig_w = go.Figure(go.Bar(x=w_vals, y=w_names, orientation='h', marker_color="#3b82f6"))
-                fig_w.update_layout(title="머신러닝이 최적화한 팩터별 가중치 (β)", height=340, margin=dict(l=10, r=10, t=40, b=10))
-                st.plotly_chart(fig_w, use_container_width=True)
-
-            # 116개 전체 팩터 IC 통계 검정 순위표
-            with st.expander(f"📊 {ticker_name} - 116개 전체 팩터 IC 통계 검정 순위표 보기"):
+            # 전체 팩터 IC 통계 검정 순위표
+            with st.expander(f"📊 {ticker_name} - 전체 팩터 IC 통계 검정 순위표 (총 {res['total_tested']}개 중 {len(res['selected_factors'])}개 채택)"):
                 display_ic = res["ic_df"].copy()
                 display_ic["스크리닝 결과"] = display_ic["팩터코드"].apply(
                     lambda x: "🟢 통과 (모델 채택)" if x in res["selected_factors"] else "⚪ 탈락 (노이즈/중복)"
