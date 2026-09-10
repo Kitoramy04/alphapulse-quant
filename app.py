@@ -178,7 +178,7 @@ def fetch_community_buzz_speed(ticker_code):
     return {"speed_label": "정상 범위 (리젠 보통)", "is_surge": False}
 
 # -------------------------------------------------------------
-# 5. 116+ 팩터 라이브러리 생성 (야간 ADR 팩터 포함)
+# 5. 116+ 팩터 라이브러리 생성 (결측치 방어 bfill 적용)
 # -------------------------------------------------------------
 def build_comprehensive_factors(df_target, df_flow, macro_dict):
     f = {}
@@ -203,12 +203,13 @@ def build_comprehensive_factors(df_target, df_flow, macro_dict):
         f["SUPPLY_INST_Z20"] = (inst - inst.rolling(20).mean()) / (inst.rolling(20).std() + 1e-9)
         f["SUPPLY_INST_ACCUM_10D"] = (inst.rolling(10).sum() / (v.rolling(10).sum() + 1e-9)) * 100
 
-    # 2. 야간 ADR 직격 선행 팩터 (SKHY, SSNLF)
+    # 2. 야간 ADR 직격 선행 팩터 (SKHY, SSNLF) - bfill로 과거 NaN 원천 차단
     for adr_name in ["SKHY", "SSNLF"]:
         if adr_name in macro_dict and macro_dict[adr_name] is not None and not macro_dict[adr_name].empty:
-            m_c = macro_dict[adr_name]['Close'].reindex(df_target.index).ffill()
-            f[f"ADR_{adr_name}_1D"] = m_c.pct_change(1) * 100
-            f[f"ADR_{adr_name}_OVERNIGHT_MOM"] = (m_c.pct_change(1) - c.pct_change(1)) * 100
+            m_c = macro_dict[adr_name]['Close'].reindex(df_target.index).ffill().bfill()
+            ret_adr = m_c.pct_change(1).fillna(0) * 100
+            f[f"ADR_{adr_name}_1D"] = ret_adr
+            f[f"ADR_{adr_name}_OVERNIGHT_MOM"] = ret_adr - (c.pct_change(1).fillna(0) * 100)
 
     # 3. 멀티호라이즌 모멘텀 (14종)
     for k in [1, 2, 3, 5, 7, 10, 15, 20, 30, 45, 60, 90, 120, 180]:
@@ -250,33 +251,33 @@ def build_comprehensive_factors(df_target, df_flow, macro_dict):
     for k in [3, 5, 10, 20, 50]:
         f[f"VOL_RATIO_{k}"] = v / (v.rolling(k).mean() + 1e-9)
 
-    # 8. 글로벌 매크로 (30종)
+    # 8. 글로벌 매크로 (30종) - bfill + fillna(0)로 과거 NaN 제거
     for asset_name, m_df in macro_dict.items():
         if m_df is not None and not m_df.empty:
-            m_c = m_df['Close'].reindex(df_target.index).ffill()
-            f[f"MACRO_{asset_name}_1D"] = m_c.pct_change(1) * 100
-            f[f"MACRO_{asset_name}_5D"] = m_c.pct_change(5) * 100
-            ret_m = m_c.pct_change(1)
-            f[f"MACRO_{asset_name}_20D_Z"] = (ret_m - ret_m.rolling(20).mean()) / (ret_m.rolling(20).std() + 1e-9)
+            m_c = m_df['Close'].reindex(df_target.index).ffill().bfill()
+            f[f"MACRO_{asset_name}_1D"] = m_c.pct_change(1).fillna(0) * 100
+            f[f"MACRO_{asset_name}_5D"] = m_c.pct_change(5).fillna(0) * 100
+            ret_m = m_c.pct_change(1).fillna(0)
+            f[f"MACRO_{asset_name}_20D_Z"] = ((ret_m - ret_m.rolling(20).mean()) / (ret_m.rolling(20).std() + 1e-9)).fillna(0)
 
     return pd.DataFrame(f, index=df_target.index)
 
 # -------------------------------------------------------------
-# 6. 듀얼 호라이즌 매크로 중기 레짐(Regime Prior) 산출 엔진
+# 6. 듀얼 호라이즌 매크로 중기 레짐 산출 엔진
 # -------------------------------------------------------------
 def calculate_macro_regime_bias(macro_dict, df_target_index):
     bias = 0.0
     
     # 1. 환율 20일 Z-Score
     if "USDKRW" in macro_dict and not macro_dict["USDKRW"].empty:
-        c_usdkrw = macro_dict["USDKRW"]['Close'].reindex(df_target_index).ffill()
+        c_usdkrw = macro_dict["USDKRW"]['Close'].reindex(df_target_index).ffill().bfill()
         if len(c_usdkrw) >= 20:
             z_fx = (c_usdkrw.iloc[-1] - c_usdkrw.tail(20).mean()) / (c_usdkrw.tail(20).std() + 1e-9)
             bias -= float(np.clip(z_fx * 1.5, -3.0, 3.0))
 
     # 2. 미국 10년물 국채금리(TNX) 추세
     if "TNX" in macro_dict and not macro_dict["TNX"].empty:
-        c_tnx = macro_dict["TNX"]['Close'].reindex(df_target_index).ffill()
+        c_tnx = macro_dict["TNX"]['Close'].reindex(df_target_index).ffill().bfill()
         if len(c_tnx) >= 20:
             tnx_mom20 = (c_tnx.iloc[-1] / (c_tnx.iloc[-20] + 1e-9) - 1) * 100
             bias -= float(np.clip(tnx_mom20 * 0.15, -2.0, 2.0))
@@ -284,7 +285,7 @@ def calculate_macro_regime_bias(macro_dict, df_target_index):
     # 3. 글로벌 반도체/테크 모멘텀 (SOXX, QQQ)
     tech_proxy = macro_dict.get("SOXX", macro_dict.get("QQQ"))
     if tech_proxy is not None and not tech_proxy.empty:
-        c_tech = tech_proxy['Close'].reindex(df_target_index).ffill()
+        c_tech = tech_proxy['Close'].reindex(df_target_index).ffill().bfill()
         if len(c_tech) >= 20:
             tech_mom20 = (c_tech.iloc[-1] / (c_tech.iloc[-20] + 1e-9) - 1) * 100
             bias += float(np.clip(tech_mom20 * 0.2, -3.0, 3.0))
@@ -316,7 +317,7 @@ def apply_event_shock_multiplier(prob_up, base_magnitude, event_type="None"):
     return float(adjusted_prob), float(adjusted_mag), multiplier
 
 # -------------------------------------------------------------
-# 8. 데이터 일괄 수집 엔진 (SKHY, SSNLF 야간 ADR 티커 탑재)
+# 8. 데이터 일괄 수집 엔진
 # -------------------------------------------------------------
 @st.cache_data(ttl=900)
 def load_all_base_assets():
@@ -332,8 +333,8 @@ def load_all_base_assets():
         "QQQ": "QQQ", "SPY": "SPY", "SOXX": "SOXX", "WTI": "CL=F",
         "COPPER": "HG=F", "GOLD": "GC=F", "TNX": "^TNX", "USDKRW": "KRW=X",
         "URNM": "URNM", "MU": "MU", "NVDA": "NVDA",
-        "SKHY": "SKHY",     # 🇺🇸 SK하이닉스 미 증시 ADR (야간 직격 시그널)
-        "SSNLF": "SSNLF"    # 🇺🇸 삼성전자 미국 장외 ADR
+        "SKHY": "SKHY",
+        "SSNLF": "SSNLF"
     }
     targets = {}
     macros = {}
@@ -371,7 +372,7 @@ def load_all_base_assets():
     return targets, macros
 
 # -------------------------------------------------------------
-# 9. 머신러닝 학습 및 적중도 산출 엔진 (미래 데이터 자동 누적)
+# 9. 머신러닝 학습 및 적중도 산출 엔진 (표본 결측치 완전 방어)
 # -------------------------------------------------------------
 def run_advanced_quant_engine(df_target, df_flow, macro_dict, buzz_info, event_type="None"):
     df_clean = df_target.dropna(subset=['Close']).copy()
@@ -484,7 +485,6 @@ def run_advanced_quant_engine(df_target, df_flow, macro_dict, buzz_info, event_t
 # -------------------------------------------------------------
 st.markdown("## 🏛️ AlphaPulse 인스티튜셔널 퀀트 터미널 Pro")
 
-# 사이드바 이벤트 쇼크 셀렉터
 st.sidebar.markdown("### ⚡ 거시 변수 & 공시 쇼크 필터")
 event_choice = st.sidebar.selectbox(
     "오늘 장 마감 후 특이 이벤트 반영",
@@ -533,7 +533,6 @@ for ticker_name, tab, currency, ticker_code in tab_mapping:
         status_color = "🟢" if is_market_open else "🌙"
         st.caption(f"시스템 시각: {time_str} | **{status_color} {session_status}**")
 
-        # 상단 요약 카드
         c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric(f"{ticker_name} 현재가/종가", format_price(res['latest_close'], currency), f"{res['price_change']:+.2f}%")
         c2.metric("전수 백테스트 팩터", f"{res['total_tested']}개", "수급/기술/매크로/ADR")
