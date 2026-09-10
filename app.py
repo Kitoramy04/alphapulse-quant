@@ -178,7 +178,7 @@ def fetch_community_buzz_speed(ticker_code):
     return {"speed_label": "정상 범위 (리젠 보통)", "is_surge": False}
 
 # -------------------------------------------------------------
-# 5. 116+ 팩터 라이브러리 생성 (결측치 방어 bfill 적용)
+# 5. 116+ 팩터 라이브러리 생성 (시차 일치 및 결측치 방어)
 # -------------------------------------------------------------
 def build_comprehensive_factors(df_target, df_flow, macro_dict):
     f = {}
@@ -203,7 +203,7 @@ def build_comprehensive_factors(df_target, df_flow, macro_dict):
         f["SUPPLY_INST_Z20"] = (inst - inst.rolling(20).mean()) / (inst.rolling(20).std() + 1e-9)
         f["SUPPLY_INST_ACCUM_10D"] = (inst.rolling(10).sum() / (v.rolling(10).sum() + 1e-9)) * 100
 
-    # 2. 야간 ADR 직격 선행 팩터 (SKHY, SSNLF) - bfill로 과거 NaN 원천 차단
+    # 2. 야간 ADR 직격 선행 팩터 (SKHY, SSNLF) - bfill로 0-채움 처리
     for adr_name in ["SKHY", "SSNLF"]:
         if adr_name in macro_dict and macro_dict[adr_name] is not None and not macro_dict[adr_name].empty:
             m_c = macro_dict[adr_name]['Close'].reindex(df_target.index).ffill().bfill()
@@ -251,7 +251,7 @@ def build_comprehensive_factors(df_target, df_flow, macro_dict):
     for k in [3, 5, 10, 20, 50]:
         f[f"VOL_RATIO_{k}"] = v / (v.rolling(k).mean() + 1e-9)
 
-    # 8. 글로벌 매크로 (30종) - bfill + fillna(0)로 과거 NaN 제거
+    # 8. 글로벌 매크로 (30종) - bfill + fillna(0)
     for asset_name, m_df in macro_dict.items():
         if m_df is not None and not m_df.empty:
             m_c = m_df['Close'].reindex(df_target.index).ffill().bfill()
@@ -263,7 +263,7 @@ def build_comprehensive_factors(df_target, df_flow, macro_dict):
     return pd.DataFrame(f, index=df_target.index)
 
 # -------------------------------------------------------------
-# 6. 듀얼 호라이즌 매크로 중기 레짐 산출 엔진
+# 6. 듀얼 호라이즌 매크로 중기 레짐(Regime Prior) 산출 엔진
 # -------------------------------------------------------------
 def calculate_macro_regime_bias(macro_dict, df_target_index):
     bias = 0.0
@@ -293,28 +293,19 @@ def calculate_macro_regime_bias(macro_dict, df_target_index):
     return float(np.clip(bias, -5.0, 5.0))
 
 # -------------------------------------------------------------
-# 7. 매크로 충격 및 이벤트 쇼크 오버레이 엔진
+# 7. 매크로 충격 및 이벤트 변동성 확장 엔진
 # -------------------------------------------------------------
-def apply_event_shock_multiplier(prob_up, base_magnitude, event_type="None"):
+def apply_event_shock_multiplier(base_magnitude, event_type="None"):
     multiplier = 1.0
-    event_bias = 0.0
-    
     if event_type == "FOMC / 금리 결정":
         multiplier = 1.75
-        event_bias = 0.0
     elif event_type == "미국 CPI 발표":
         multiplier = 1.50
-        event_bias = 0.0
-    elif event_type == "DART 호재 공시(자사주/대규모 수주)":
-        multiplier = 1.25
-        event_bias = +2.5
-    elif event_type == "DART 악재 공시(유상증자/CB발행)":
-        multiplier = 1.35
-        event_bias = -3.5
+    elif event_type in ["DART 호재 공시(자사주/대규모 수주)", "DART 악재 공시(유상증자/CB발행)"]:
+        multiplier = 1.30
 
-    adjusted_prob = np.clip(prob_up + event_bias, 5.0, 95.0)
     adjusted_mag = base_magnitude * multiplier
-    return float(adjusted_prob), float(adjusted_mag), multiplier
+    return float(adjusted_mag), multiplier
 
 # -------------------------------------------------------------
 # 8. 데이터 일괄 수집 엔진
@@ -372,7 +363,7 @@ def load_all_base_assets():
     return targets, macros
 
 # -------------------------------------------------------------
-# 9. 머신러닝 학습 및 적중도 산출 엔진 (표본 결측치 완전 방어)
+# 9. 순수 백테스트 기반 머신러닝 엔진 (유효기간 보정 IC 적용)
 # -------------------------------------------------------------
 def run_advanced_quant_engine(df_target, df_flow, macro_dict, buzz_info, event_type="None"):
     df_clean = df_target.dropna(subset=['Close']).copy()
@@ -397,12 +388,25 @@ def run_advanced_quant_engine(df_target, df_flow, macro_dict, buzz_info, event_t
     if n_obs < 60:
         return None
         
+    # [핵심] 상장시기 기간보정 Active-Period IC 검정
+    # 신규 상장 팩터(ADR 등)가 과거 0 패딩 때문에 인위적으로 탈락하지 않고
+    # 실제 데이터가 존재했던 유효 구간의 통계적 설명력을 공정하게 평가
     ic_stats = []
     for col in X_train.columns:
-        ic, pval = spearmanr(X_train[col], ret_train)
+        s = X_train[col]
+        active_mask = (s != 0.0) & ~s.isna()
+        
+        if active_mask.sum() >= 30:  # 최소 30거래일 이상 실제 거래 데이터 존재 시 유효구간 검정
+            ic, pval = spearmanr(s.loc[active_mask], ret_train.loc[active_mask])
+            eff_n = active_mask.sum()
+        else:
+            ic, pval = spearmanr(s, ret_train)
+            eff_n = n_obs
+            
         if np.isnan(ic):
             ic, pval = 0.0, 1.0
-        t_stat = ic * np.sqrt(n_obs - 2) / (np.sqrt(1.0 - ic**2) + 1e-9)
+            
+        t_stat = ic * np.sqrt(eff_n - 2) / (np.sqrt(1.0 - ic**2) + 1e-9)
         ic_stats.append({
             "팩터코드": col,
             "스피어만 IC": ic,
@@ -412,6 +416,8 @@ def run_advanced_quant_engine(df_target, df_flow, macro_dict, buzz_info, event_t
         })
         
     ic_df = pd.DataFrame(ic_stats).sort_values(by="절대 IC", ascending=False)
+    
+    # 통계적 유의성 통과 팩터만 선별 (어떤 팩터든 동일한 기준 적용)
     sig_candidates = ic_df[(ic_df["절대 IC"] >= 0.025) & (ic_df["p-value"] < 0.15)]["팩터코드"].tolist()
     if len(sig_candidates) < 6:
         selected_factors = ic_df["팩터코드"].head(8).tolist()
@@ -420,6 +426,7 @@ def run_advanced_quant_engine(df_target, df_flow, macro_dict, buzz_info, event_t
     else:
         selected_factors = sig_candidates
         
+    # 지수 감쇠 학습 (최근 28거래일에 50% 가중치 부여)
     decay_lambda = 0.975
     sample_weights = np.array([decay_lambda ** (n_obs - 1 - i) for i in range(n_obs)])
     
@@ -428,6 +435,7 @@ def run_advanced_quant_engine(df_target, df_flow, macro_dict, buzz_info, event_t
     X_latest_scaled = scaler.transform(X_latest_row[selected_factors])
     X_prev_scaled = scaler.transform(X_prev_row[selected_factors])
     
+    # 순수 L2 Ridge 회귀가 데이터 기반으로 팩터별 가중치(beta)를 산출
     model = LogisticRegression(penalty='l2', C=0.3, random_state=42)
     model.fit(X_train_scaled, y_train, sample_weight=sample_weights)
     
@@ -437,18 +445,17 @@ def run_advanced_quant_engine(df_target, df_flow, macro_dict, buzz_info, event_t
         
     prob_up_yesterday = float(model.predict_proba(X_prev_scaled)[0][1] * 100)
 
-    # 듀얼 호라이즌 매크로 레짐 오버레이 결합
+    # 듀얼 호라이즌: 20일 거시 레짐 바이어스 결합
     macro_regime_bias = calculate_macro_regime_bias(macro_dict, df_clean.index)
-    prob_with_regime = np.clip(prob_up_raw + macro_regime_bias, 5.0, 95.0)
-
-    # 기본 예상 변동폭
-    daily_vol = float(df_clean['Close'].pct_change().tail(20).std() * 100)
-    base_magnitude = ((prob_with_regime - 50.0) / 50.0) * daily_vol * 1.35
-
-    # 이벤트 쇼크 적용
-    final_prob_up, final_magnitude, vol_mult = apply_event_shock_multiplier(prob_with_regime, base_magnitude, event_type)
+    final_prob_up = float(np.clip(prob_up_raw + macro_regime_bias, 5.0, 95.0))
     final_prob_down = float(100.0 - final_prob_up)
 
+    # 변동폭 산출 및 이벤트 변동성 확장 계수 적용
+    daily_vol = float(df_clean['Close'].pct_change().tail(20).std() * 100)
+    base_magnitude = ((final_prob_up - 50.0) / 50.0) * daily_vol * 1.35
+    final_magnitude, vol_mult = apply_event_shock_multiplier(base_magnitude, event_type)
+
+    # 머신러닝이 최적화한 가중치와 기여도
     coefs = model.coef_[0]
     scaled_curr = X_latest_scaled[0]
     contributions = {f_name: float(coefs[idx] * scaled_curr[idx] * 8.0) for idx, f_name in enumerate(selected_factors)}
@@ -577,7 +584,7 @@ for ticker_name, tab, currency, ticker_code in tab_mapping:
 
             col_dir, col_gauge = st.columns([1.3, 1])
             with col_dir:
-                event_badge = f" [⚡ 이벤트 쇼크: {event_choice}]" if event_choice != "None" else ""
+                event_badge = f" [⚡ {event_choice}]" if event_choice != "None" else ""
                 if prob_up >= 54.0:
                     st.success(f"### 📈 [상승 우세] 다음 거래일 상승 확률: {prob_up:.1f}%{event_badge}")
                     st.write(f"**하락 반대 확률**: {prob_down:.1f}% | 모델 확신도: **상승 우위 (+{prob_up - 50:.1f}%p)**")
@@ -591,7 +598,7 @@ for ticker_name, tab, currency, ticker_code in tab_mapping:
                     st.write(f"**상승**: {prob_up:.1f}% vs **하락**: {prob_down:.1f}%")
                     st.write(f"🎯 **예상 일일 변동폭**: **±{res['daily_vol']*0.5 * res['vol_multiplier']:.2f}% 내외 박스권 횡보**")
                 
-                st.caption(f"※ 단기 수급/야간 ADR + 20일 중기 매크로 레짐({res['macro_bias']:+.1f}%p) + 이벤트 쇼크 필터가 결합된 최종 확률입니다.")
+                st.caption(f"※ 텍티컬 팩터 + 20일 중기 매크로 레짐({res['macro_bias']:+.1f}%p)이 결합된 순수 백테스트 결과입니다.")
 
             # 게이지 차트
             with col_gauge:
