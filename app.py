@@ -506,7 +506,7 @@ for ticker_name, tab, currency, ticker_code in tab_mapping:
                         'steps': [
                             {'range': [-100, -20], 'color': "rgba(239, 68, 68, 0.2)"},
                             {'range': [-20, 20], 'color': "rgba(107, 114, 128, 0.2)"},
-                            {'range': 20, 100], 'color': "rgba(16, 185, 129, 0.2)"}
+                            {'range': [20, 100], 'color': "rgba(16, 185, 129, 0.2)"}
                         ],
                         'threshold': {'line': {'color': "white", 'width': 3}, 'thickness': 0.75, 'value': 0}
                     }
